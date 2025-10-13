@@ -74,3 +74,81 @@
             balance-1: u0 ;; initially, balance-1 (y) is 0
         })
     )
+
+    ;; If pool does already exist, throw an error
+    (asserts! pool-does-not-exist ERR_POOL_ALREADY_EXISTS)
+    ;; If the token-0 principal is not "less than" the token-1 principal, throw an error
+    (asserts! (is-ok (correct-token-ordering token-0-principal token-1-principal)) ERR_INCORRECT_TOKEN_ORDERING)
+    
+    ;; Update the `pools` map with the new pool data
+    (map-set pools pool-id pool-data)
+    (print { action: "create-pool", data: pool-data})
+    (ok true)
+    )
+)
+
+
+;; add-liquidity
+;; Adds liquidity to a given pool
+;; Ensure the pool exists, calculate what token amounts are possible to add as liquidity, handle the case where this is the first time liquidity is being added
+;; Transfer tokens from user to pool, and update mappings as needed
+(define-public (add-liquidity (token-0 <ft-trait>) (token-1 <ft-trait>) (fee uint) (amount-0-desired uint) (amount-1-desired uint) (amount-0-min uint) (amount-1-min uint))
+    (let
+        (
+            ;; compute the pool id and fetch the current state of the pool from the mapping
+            (pool-info {
+                token-0: token-0,
+                token-1: token-1,
+                fee: fee
+            })
+            (pool-id (get-pool-id pool-info))
+            (pool-data (unwrap! (map-get? pools pool-id) (err u0)))
+            (sender tx-sender)
+            
+            (pool-liquidity (get liquidity pool-data))
+            (balance-0 (get balance-0 pool-data))
+            (balance-1 (get balance-1 pool-data))
+
+            ;; fetch the current liquidity of the user in the pool (default 0 if no existing position)
+            (user-liquidity (unwrap! (get-position-liquidity pool-id sender) (err u0)))
+
+            ;; is this the first time liquidity is being added?
+            (is-initial-liquidity (is-eq pool-liquidity u0))
+            (amounts 
+                (if 
+                    is-initial-liquidity
+                    ;; if it is the first time, we can add tokens in whatever amounts we want
+                    {amount-0: amount-0-desired, amount-1: amount-1-desired}
+                    ;; otherwise, we use get-amounts to calculate the amounts of tokens to add within the constraints
+                    (unwrap! (get-amounts amount-0-desired amount-1-desired amount-0-min amount-1-min balance-0 balance-1) (err u0))
+                )
+            )
+            (amount-0 (get amount-0 amounts))
+            (amount-1 (get amount-1 amounts))
+            ;; calculate the new liquidity (L value) 
+            (new-liquidity 
+                (if 
+                    is-initial-liquidity
+
+                    ;; if this is first-time liquidity, we subtract MINIMUM_LIQUIDITY to make sure that the pool has at least some liquidity forever
+                    ;; so we compute L = sqrt(x * y) - MINIMUM_LIQUIDITY
+                    (- (sqrti (* amount-0 amount-1)) MINIMUM_LIQUIDITY)
+
+                    ;; if it is not the first time, we update L based on how much % of the pool's liquidity this user is adding
+                    ;; min( amount0 * pool-liquidity / balance0 , amount1 * pool-liquidity / balance1 )
+                    (min (/ (* amount-0 pool-liquidity) balance-0) (/ (* amount-1 pool-liquidity) balance-1))
+                )
+            )
+            (new-pool-liquidity
+                (if
+                    is-initial-liquidity
+                    (+ new-liquidity MINIMUM_LIQUIDITY)
+                    new-liquidity
+                )
+            )
+        )
+        (asserts! (> new-liquidity u0) ERR_INSUFFICIENT_LIQUIDITY_MINTED)
+
+        ;; transfer tokens from user to pool
+        (try! (contract-call? token-0 transfer amount-0 sender THIS_CONTRACT none))
+        (try! (contract-call? token-1 transfer amount-1 sender THIS_CONTRACT none))
